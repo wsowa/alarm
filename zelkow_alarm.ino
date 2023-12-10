@@ -14,6 +14,7 @@ SET_LOOP_TASK_STACK_SIZE(48 * 1024);
 #include "mbedtls/pem.h"
 #include "esp_sntp.h"
 
+#define MODEM_GPIO_PIN 27
 #define CAMERAS_GPIO_PIN 12
 #define LIGHTS_GPIO_PIN 13
 #define SIREN_GPIO_PIN 14
@@ -44,12 +45,13 @@ ESP32AnalogRead adc;
 
 struct configData {
   uint sleepInterval;
+  uint hibernationTime;
   uint alarmKeepAwakeTime;
+  uint alarmHibernationInhibitTime;
   uint alarmLightsOnTime;
   uint alarmBlinkingTime;
   uint blinkingIntervalMs;
   uint alarmCamerasOnTime;
-  bool keepAwake;
   uint lightsMode;
   uint camerasMode;
 };
@@ -59,19 +61,19 @@ struct configData {
 #define LIGHTS_MODE_BLINKING 2
 #define LIGHTS_MODE_ON 3
 
-
 #define CAMERAS_MODE_AUTO 0
 #define CAMERAS_MODE_OFF 1
 #define CAMERAS_MODE_ON 2
 
 volatile configData config = {
   .sleepInterval = 30,
+  .hibernationTime = 0,
   .alarmKeepAwakeTime = 310,
+  .alarmHibernationInhibitTime = 900,
   .alarmLightsOnTime = 300,
   .alarmBlinkingTime = 30,
   .blinkingIntervalMs = 500,
   .alarmCamerasOnTime = 300,
-  .keepAwake = false,
   .lightsMode = LIGHTS_MODE_AUTO,
   .camerasMode = CAMERAS_MODE_AUTO
 };
@@ -82,6 +84,7 @@ volatile uint alarmLightsState = LIGHTS_MODE_OFF;
 volatile uint alarmCamerasState = CAMERAS_MODE_OFF;
 volatile int newAlarmTriggered = 0;
 bool sirenState = false;
+bool configUpdated = false;
 
 void setupSerial() {
   Serial.begin(115200);
@@ -292,7 +295,7 @@ int refreshToken() {
   return 0;
 }
 
-void updateConfig() {
+bool updateConfig() {
   WiFiClientSecure client;
   client.setInsecure();
   HttpClient http(client, sheetsHost, 443);
@@ -318,7 +321,7 @@ void updateConfig() {
 
     break;
   }
-  if (i == MAX_GET_ATTEMPTS) return;
+  if (i == MAX_GET_ATTEMPTS) return false;
 
   StaticJsonDocument<1500> doc;
   DeserializationError error = deserializeJson(doc, http.responseBody());
@@ -327,7 +330,7 @@ void updateConfig() {
     Serial.print(F("config json deserialization failed: "));
     Serial.println(error.f_str());
     logRemotely("Invalid config JSON: " + String(error.f_str()));
-    return;
+    return false;
   }
 
   JsonArray values = doc["values"];
@@ -339,18 +342,23 @@ void updateConfig() {
   }
 
   printConfig();
+  return true;
 }
 
 void setSirenOut(bool val) {
-  digitalWrite(SIREN_GPIO_PIN, !val);
+  digitalWrite(SIREN_GPIO_PIN, !val); // connected to optocoupler so low = enabled
 }
 
 void setLightsOut(bool val) {
-  digitalWrite(LIGHTS_GPIO_PIN, !val);
+  digitalWrite(LIGHTS_GPIO_PIN, !val); // connected to optocoupler so low = enabled
 }
 
 void setCamerasOut(bool val) {
-  digitalWrite(CAMERAS_GPIO_PIN, !val);
+  digitalWrite(CAMERAS_GPIO_PIN, !val); // connected to optocoupler so low = enabled
+}
+
+void setModemOut(bool val) {
+  digitalWrite(MODEM_GPIO_PIN, val); // connected to optocoupler so high = enabled
 }
 
 void setSiren(bool newState) {
@@ -409,11 +417,14 @@ void updateConfigAttribute(const char* k, const char* v) {
   else if (!strcmp(k, "sleepInterval")) {
     config.sleepInterval = atoi(v);
   }
+  else if (!strcmp(k, "hibernationTime")) {
+    config.hibernationTime = atoi(v);
+  }
   else if (!strcmp(k, "alarmKeepAwakeTime")) {
     config.alarmKeepAwakeTime = atoi(v);
   }
-  else if (!strcmp(k, "keepAwake")) {
-    config.keepAwake = (!strcasecmp(v, "TRUE"));
+  else if (!strcmp(k, "alarmHibernationInhibitTime")) {
+    config.alarmHibernationInhibitTime = atoi(v);
   }
   else if (!strcmp(k, "alarmLightsOnTime")) {
     config.alarmLightsOnTime = atoi(v);
@@ -452,14 +463,15 @@ void printConfig() {
 
   }
 
-  Serial.printf("Config: sleepInterval=%d, alarmKeepAwakeTime=%d, alarmLightsOnTime=%d, alarmBlinkingTime=%d, blinkingIntervalMs=%d, alarmCamerasOnTime=%d, keepAwake=%d, lightsMode=%s(%d), camerasMode=%s(%d)\n",
-                config.sleepInterval, config.alarmKeepAwakeTime, config.alarmLightsOnTime, config.alarmBlinkingTime, config.blinkingIntervalMs, config.alarmCamerasOnTime, config.keepAwake, lightsMode, config.lightsMode, camerasMode, config.camerasMode);
+  Serial.printf("Config: sleepInterval=%d, hibernationTime=%d, alarmKeepAwakeTime=%d, alarmHibernationInhibitTime=%d, alarmLightsOnTime=%d, alarmBlinkingTime=%d, blinkingIntervalMs=%d, alarmCamerasOnTime=%d, lightsMode=%s(%d), camerasMode=%s(%d)\n",
+                config.sleepInterval, config.hibernationTime, config.alarmKeepAwakeTime, config.alarmHibernationInhibitTime, config.alarmLightsOnTime, config.alarmBlinkingTime, config.blinkingIntervalMs, config.alarmCamerasOnTime, lightsMode, config.lightsMode, camerasMode, config.camerasMode);
 }
 
 void setupGpio() {
-  pinMode(CAMERAS_GPIO_PIN, OUTPUT); digitalWrite(CAMERAS_GPIO_PIN, HIGH);
-  pinMode(LIGHTS_GPIO_PIN, OUTPUT); digitalWrite(LIGHTS_GPIO_PIN, HIGH);
-  pinMode(SIREN_GPIO_PIN, OUTPUT); digitalWrite(SIREN_GPIO_PIN, HIGH);
+  pinMode(MODEM_GPIO_PIN, OUTPUT); digitalWrite(MODEM_GPIO_PIN, HIGH); // connected to N-channel mosfet so high = enabled
+  pinMode(CAMERAS_GPIO_PIN, OUTPUT); digitalWrite(CAMERAS_GPIO_PIN, HIGH); // connected to optocoupler so low = enabled
+  pinMode(LIGHTS_GPIO_PIN, OUTPUT); digitalWrite(LIGHTS_GPIO_PIN, HIGH); // connected to optocoupler so low = enabled
+  pinMode(SIREN_GPIO_PIN, OUTPUT); digitalWrite(SIREN_GPIO_PIN, HIGH); // connected to optocoupler so low = enabled
 
   pinMode(SENSOR_1_GPIO_PIN, INPUT_PULLDOWN);
   pinMode(SENSOR_2_GPIO_PIN, INPUT_PULLDOWN);
@@ -538,29 +550,51 @@ void gpioTask(void * p) {
   while (true) {
     handleAlarmTimeTick();
     driveOutputs();
-//    readInputs();
+    readInputs();
     delay(20);
   }
 }
 
 bool canSleep() {
   unsigned long now = millis()/1000;
-  return (now > alarmTriggeredTime + config.alarmKeepAwakeTime) && !config.keepAwake && !isBlinking();
+  return (now > alarmTriggeredTime + config.alarmKeepAwakeTime) && config.sleepInterval > 0 && !isBlinking() && newAlarmTriggered == 0;
+}
+
+bool canHibernate() {
+  unsigned long now = millis()/1000;
+  return (now > alarmTriggeredTime + config.alarmHibernationInhibitTime) && (config.hibernationTime > 0) && configUpdated;
 }
 
 void sleep() {
-  Serial.printf("Sleeping for %d sec\n", config.sleepInterval);
-  WiFi.disconnect(true);  // Disconnect from the network
-  WiFi.mode(WIFI_OFF);    // Switch WiFi off
+  uint32_t sleepTime;
+  
+  if (canHibernate()) {
+    sleepTime = config.hibernationTime;
+    char buff[32];
+    snprintf(buff, 31, "Hibernating for %d sec", sleepTime);
+    Serial.println(buff);
+    logRemotely(buff);
+   
+    WiFi.disconnect(true);  // Disconnect from the network
+    WiFi.mode(WIFI_OFF);    // Switch WiFi off
+    setModemOut(false); 
+    configUpdated = false;
+  } else {
+    sleepTime = config.sleepInterval;
+    Serial.printf("Sleeping for %d sec\n", sleepTime);
+    
+    WiFi.disconnect(true);  // Disconnect from the network
+    WiFi.mode(WIFI_OFF);    // Switch WiFi off
+  }
 
-  esp_sleep_enable_timer_wakeup(config.sleepInterval * 1000 * 1000);
+  esp_sleep_enable_timer_wakeup(sleepTime * 1000 * 1000);
   gpio_wakeup_enable(SENSOR_1_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable(SENSOR_2_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable(SENSOR_3_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable(SENSOR_4_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable(SENSOR_5_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable(SENSOR_6_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
-//  esp_sleep_enable_gpio_wakeup();
+  esp_sleep_enable_gpio_wakeup();
   gpio_hold_en(SENSOR_1_GPIO_PIN);
   gpio_hold_en(SENSOR_2_GPIO_PIN);
   gpio_hold_en(SENSOR_3_GPIO_PIN);
@@ -569,10 +603,16 @@ void sleep() {
   gpio_hold_en(SENSOR_6_GPIO_PIN);
   Serial.flush();
   delay(100);
-  esp_light_sleep_start();
-  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  delay(200);
-  Serial.printf("Wakeup cause: %d\n", cause);
+  if (newAlarmTriggered == 0) {
+    esp_light_sleep_start();
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    setModemOut(true);
+    delay(200);
+    Serial.printf("Wakeup cause: %d\n", cause);
+  } else {
+    setModemOut(true);
+    Serial.println("Sleep cancelled due to alarm");
+  }
 }
 
 void resyncNtp() {
@@ -592,8 +632,10 @@ void loop() {
   resyncNtp();
 
   notifyIfAlarmTriggered();
-  updateConfig();
+  configUpdated = updateConfig();
 
+  adc.attach(BATT_VOLTAGE_ADC_GPIO_PIN); //will it stabilise temp reading?
+  adc.readMiliVolts();
   adc.attach(TEMPERATURE_ADC_GPIO_PIN);
   uint32_t tempVol = adc.readMiliVolts();
   adc.attach(BATT_VOLTAGE_ADC_GPIO_PIN);
@@ -636,12 +678,13 @@ void notifyIfAlarmTriggered() {
     newAlarmTriggered = 0;
   }
 
+  int i = 0;
   if (sensor) {
     WiFiClientSecure client;
     client.setInsecure();
     HttpClient http(client, triggerHost, 443);
 
-    for (int i = 0; i < MAX_GET_ATTEMPTS; i++) {
+    for (; i < MAX_GET_ATTEMPTS; i++) {
       int r = http.get(alarmPath);
       if (r != 0) {
         Serial.println("ALARM TRIGGERED - ERROR on GET from " + String(alarmPath) + " : " + String(r));
@@ -665,7 +708,11 @@ void notifyIfAlarmTriggered() {
     Serial.println(buff);
     logRemotely(buff);
   }
+
+  if (i == MAX_GET_ATTEMPTS && newAlarmTriggered == 0) {
+    newAlarmTriggered = sensor;
+  }
 }
 
 
-// TODO: hibernate, 2nd cam, ota
+// TODO: 2nd cam, ota
