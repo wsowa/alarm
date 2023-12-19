@@ -4,6 +4,7 @@ SET_LOOP_TASK_STACK_SIZE(48 * 1024);
 #include <ArduinoHttpClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <string.h>
 #include <esp_sleep.h>
 #include <driver/adc.h>
 #include "driver/gpio.h"
@@ -22,12 +23,9 @@ SET_LOOP_TASK_STACK_SIZE(48 * 1024);
 #define TEMPERATURE_ADC_GPIO_PIN 36
 #define BATT_VOLTAGE_ADC_GPIO_PIN 39
 
-#define SENSOR_1_GPIO_PIN GPIO_NUM_16
-#define SENSOR_2_GPIO_PIN GPIO_NUM_17
-#define SENSOR_3_GPIO_PIN GPIO_NUM_18
-#define SENSOR_4_GPIO_PIN GPIO_NUM_19
-#define SENSOR_5_GPIO_PIN GPIO_NUM_22
-#define SENSOR_6_GPIO_PIN GPIO_NUM_23
+
+gpio_num_t sensorPins[] = {GPIO_NUM_16, GPIO_NUM_17, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_22, GPIO_NUM_23 };
+#define SENSORS_NUMBER (sizeof(sensorPins)/sizeof(gpio_num_t))
 
 
 #define NTP_RESYNC_INTERVAL 3600
@@ -54,6 +52,7 @@ struct configData {
   uint alarmCamerasOnTime;
   uint lightsMode;
   uint camerasMode;
+  uint activeSensors;
 };
 
 #define LIGHTS_MODE_AUTO 0
@@ -65,6 +64,15 @@ struct configData {
 #define CAMERAS_MODE_OFF 1
 #define CAMERAS_MODE_ON 2
 
+#define PRINTF_BINARY_PATTERN_INT8 "%c%c%c%c%c%c"
+#define PRINTF_BYTE_TO_BINARY_INT8(i)    \
+    (((i) & 0x20ll) ? '1' : '0'), \
+    (((i) & 0x10ll) ? '1' : '0'), \
+    (((i) & 0x08ll) ? '1' : '0'), \
+    (((i) & 0x04ll) ? '1' : '0'), \
+    (((i) & 0x02ll) ? '1' : '0'), \
+    (((i) & 0x01ll) ? '1' : '0')
+    
 volatile configData config = {
   .sleepInterval = 30,
   .hibernationTime = 0,
@@ -75,7 +83,8 @@ volatile configData config = {
   .blinkingIntervalMs = 500,
   .alarmCamerasOnTime = 300,
   .lightsMode = LIGHTS_MODE_AUTO,
-  .camerasMode = CAMERAS_MODE_AUTO
+  .camerasMode = CAMERAS_MODE_AUTO,
+  .activeSensors = 0b111111
 };
 
 volatile unsigned long alarmTriggeredTime = 0;
@@ -438,6 +447,9 @@ void updateConfigAttribute(const char* k, const char* v) {
   else if (!strcmp(k, "alarmCamerasOnTime")) {
     config.alarmCamerasOnTime = atoi(v);
   }
+  else if (!strcmp(k, "activeSensors")) {
+    config.activeSensors = std::stoi(v, nullptr,2);
+  }
   else {
     Serial.printf("Unknown config key %s with value %s\n", k, v);
     logRemotely("Unknown config key " + String(k) + " with value " + String(v));
@@ -463,8 +475,8 @@ void printConfig() {
 
   }
 
-  Serial.printf("Config: sleepInterval=%d, hibernationTime=%d, alarmKeepAwakeTime=%d, alarmHibernationInhibitTime=%d, alarmLightsOnTime=%d, alarmBlinkingTime=%d, blinkingIntervalMs=%d, alarmCamerasOnTime=%d, lightsMode=%s(%d), camerasMode=%s(%d)\n",
-                config.sleepInterval, config.hibernationTime, config.alarmKeepAwakeTime, config.alarmHibernationInhibitTime, config.alarmLightsOnTime, config.alarmBlinkingTime, config.blinkingIntervalMs, config.alarmCamerasOnTime, lightsMode, config.lightsMode, camerasMode, config.camerasMode);
+  Serial.printf("Config: sleepInterval=%d, hibernationTime=%d, alarmKeepAwakeTime=%d, alarmHibernationInhibitTime=%d, alarmLightsOnTime=%d, alarmBlinkingTime=%d, blinkingIntervalMs=%d, alarmCamerasOnTime=%d, lightsMode=%s(%d), camerasMode=%s(%d), activeSensors=" PRINTF_BINARY_PATTERN_INT8 "\n",
+                config.sleepInterval, config.hibernationTime, config.alarmKeepAwakeTime, config.alarmHibernationInhibitTime, config.alarmLightsOnTime, config.alarmBlinkingTime, config.blinkingIntervalMs, config.alarmCamerasOnTime, lightsMode, config.lightsMode, camerasMode, config.camerasMode, PRINTF_BYTE_TO_BINARY_INT8(config.activeSensors));
 }
 
 void setupGpio() {
@@ -473,13 +485,9 @@ void setupGpio() {
   pinMode(LIGHTS_GPIO_PIN, OUTPUT); digitalWrite(LIGHTS_GPIO_PIN, HIGH); // connected to optocoupler so low = enabled
   pinMode(SIREN_GPIO_PIN, OUTPUT); digitalWrite(SIREN_GPIO_PIN, HIGH); // connected to optocoupler so low = enabled
 
-  pinMode(SENSOR_1_GPIO_PIN, INPUT_PULLDOWN);
-  pinMode(SENSOR_2_GPIO_PIN, INPUT_PULLDOWN);
-  pinMode(SENSOR_3_GPIO_PIN, INPUT_PULLDOWN);
-  pinMode(SENSOR_4_GPIO_PIN, INPUT_PULLDOWN);
-  pinMode(SENSOR_5_GPIO_PIN, INPUT_PULLDOWN);
-  pinMode(SENSOR_6_GPIO_PIN, INPUT_PULLDOWN);
-
+  for (int i=0; i<SENSORS_NUMBER; i++) {
+    pinMode(sensorPins[i], INPUT_PULLDOWN);
+  }
 }
 
 void ntpCallback(struct timeval *tv) {
@@ -536,13 +544,14 @@ void driveOutputs() {
     }
 }
 
+bool isSensorActive(int i) {
+  return ((1<<i) & config.activeSensors) != 0;
+}
+
 void readInputs() {
-  if (!digitalRead(SENSOR_1_GPIO_PIN)) alarmTriggered(1);
-  if (!digitalRead(SENSOR_2_GPIO_PIN)) alarmTriggered(2);
-  if (!digitalRead(SENSOR_3_GPIO_PIN)) alarmTriggered(3);
-  if (!digitalRead(SENSOR_4_GPIO_PIN)) alarmTriggered(4);
-  if (!digitalRead(SENSOR_5_GPIO_PIN)) alarmTriggered(5);
-  if (!digitalRead(SENSOR_6_GPIO_PIN)) alarmTriggered(6);
+  for (int i=0; i<SENSORS_NUMBER; i++) {
+    if (isSensorActive(i) && !digitalRead(sensorPins[i])) alarmTriggered(i+1);
+  }
 }
 
 void gpioTask(void * p) {
@@ -588,19 +597,19 @@ void sleep() {
   }
 
   esp_sleep_enable_timer_wakeup(sleepTime * 1000000ull);
-  gpio_wakeup_enable(SENSOR_1_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable(SENSOR_2_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable(SENSOR_3_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable(SENSOR_4_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable(SENSOR_5_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable(SENSOR_6_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
+  
+  for (int i=0; i<SENSORS_NUMBER; i++) {
+    if (isSensorActive(i)) gpio_wakeup_enable(sensorPins[i], GPIO_INTR_LOW_LEVEL);
+    else gpio_wakeup_disable(sensorPins[i]);
+  }
+  
   esp_sleep_enable_gpio_wakeup();
-  gpio_hold_en(SENSOR_1_GPIO_PIN);
-  gpio_hold_en(SENSOR_2_GPIO_PIN);
-  gpio_hold_en(SENSOR_3_GPIO_PIN);
-  gpio_hold_en(SENSOR_4_GPIO_PIN);
-  gpio_hold_en(SENSOR_5_GPIO_PIN);
-  gpio_hold_en(SENSOR_6_GPIO_PIN);
+  
+  for (int i=0; i<SENSORS_NUMBER; i++) {
+    if (isSensorActive(i)) gpio_hold_en(sensorPins[i]);
+    else gpio_hold_dis(sensorPins[i]);
+  }
+
   Serial.flush();
   delay(100);
   if (newAlarmTriggered == 0) {
