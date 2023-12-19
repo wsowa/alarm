@@ -587,7 +587,7 @@ void sleep() {
     WiFi.mode(WIFI_OFF);    // Switch WiFi off
   }
 
-  esp_sleep_enable_timer_wakeup(sleepTime * 1000 * 1000);
+  esp_sleep_enable_timer_wakeup(sleepTime * 1000000ull);
   gpio_wakeup_enable(SENSOR_1_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable(SENSOR_2_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable(SENSOR_3_GPIO_PIN, GPIO_INTR_LOW_LEVEL);
@@ -692,7 +692,7 @@ void notifyIfAlarmTriggered() {
         delay(100);
         continue;
       }
-
+ 
       int httpCode = http.responseStatusCode();
       if (httpCode != 200) {
         Serial.println("ALARM TRIGGERED - Non 200 on GET from " + String(alarmPath) + " : " + String(httpCode));
