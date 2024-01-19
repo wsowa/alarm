@@ -27,6 +27,7 @@ SET_LOOP_TASK_STACK_SIZE(48 * 1024);
 gpio_num_t sensorPins[] = {GPIO_NUM_16, GPIO_NUM_17, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_22, GPIO_NUM_23 };
 #define SENSORS_NUMBER (sizeof(sensorPins)/sizeof(gpio_num_t))
 
+#define ADC_SAMPLES 10
 
 #define NTP_RESYNC_INTERVAL 3600
 
@@ -643,15 +644,18 @@ void loop() {
   notifyIfAlarmTriggered();
   configUpdated = updateConfig();
 
-  adc.attach(BATT_VOLTAGE_ADC_GPIO_PIN); //will it stabilise temp reading?
-  adc.readMiliVolts();
-  adc.attach(TEMPERATURE_ADC_GPIO_PIN);
-  uint32_t tempVol = adc.readMiliVolts();
-  adc.attach(BATT_VOLTAGE_ADC_GPIO_PIN);
-  uint32_t battVol = adc.readMiliVolts();
+  uint32_t tempMv = 0, battMv = 0;
+  for (int i=0; i<ADC_SAMPLES; i++) {
+    adc.attach(TEMPERATURE_ADC_GPIO_PIN);
+    tempMv += adc.readMiliVolts();
+    adc.attach(BATT_VOLTAGE_ADC_GPIO_PIN);
+    battMv += adc.readMiliVolts();
+  }
+  tempMv = tempMv / ADC_SAMPLES;
+  battMv = battMv / ADC_SAMPLES;
 
   char buff[64];
-  snprintf(buff, 63, "Alive... Batt ADC=%dmV, Temp ADC=%dmV, uptime=%ds", battVol, tempVol, millis() / 1000);
+  snprintf(buff, 63, "Alive... Batt ADC=%dmV, Temp ADC=%dmV, uptime=%ds", battMv, tempMv, millis() / 1000);
   Serial.println(buff);
   logRemotely(buff);
 
