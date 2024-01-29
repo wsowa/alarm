@@ -29,7 +29,7 @@ gpio_num_t sensorPins[] = {GPIO_NUM_16, GPIO_NUM_17, GPIO_NUM_18, GPIO_NUM_19, G
 
 #define ADC_SAMPLES 10
 
-#define NTP_RESYNC_INTERVAL 3600
+#define NTP_RESYNC_INTERVAL 1800
 
 #define TOKEN_TTL_SEC 3600
 #define TOKEN_TTL_MARGIN 60
@@ -54,6 +54,8 @@ struct configData {
   uint lightsMode;
   uint camerasMode;
   uint activeSensors;
+  uint networkWatchdogTimeout;
+  uint restartInterval;
 };
 
 #define LIGHTS_MODE_AUTO 0
@@ -85,10 +87,13 @@ volatile configData config = {
   .alarmCamerasOnTime = 300,
   .lightsMode = LIGHTS_MODE_AUTO,
   .camerasMode = CAMERAS_MODE_AUTO,
-  .activeSensors = 0b111111
+  .activeSensors = 0b111111,
+  .networkWatchdogTimeout = 3600,
+  .restartInterval = 24*3600
 };
 
 volatile unsigned long alarmTriggeredTime = 0;
+volatile unsigned long lastNetworkRead = 0;
 
 volatile uint alarmLightsState = LIGHTS_MODE_OFF;
 volatile uint alarmCamerasState = CAMERAS_MODE_OFF;
@@ -393,9 +398,7 @@ void setCamerasMode(uint mode) {
 void updateConfigAttribute(const char* k, const char* v) {
   if (!strcmp(k, "reboot")) {
     if (!strcasecmp(v, "TRUE")) {
-      Serial.println("Reboot from config!");
-      Serial.flush();
-      ESP.restart();
+      restart("Reboot from config!");
     }
   }
   else if (!strcmp(k, "sirenOn")) {
@@ -451,6 +454,12 @@ void updateConfigAttribute(const char* k, const char* v) {
   else if (!strcmp(k, "activeSensors")) {
     config.activeSensors = std::stoi(v, nullptr,2);
   }
+  else if (!strcmp(k, "networkWatchdogTimeout")) {
+    config.networkWatchdogTimeout = atoi(v);
+  }
+  else if (!strcmp(k, "restartInterval")) {
+    config.restartInterval = atoi(v);
+  }
   else {
     Serial.printf("Unknown config key %s with value %s\n", k, v);
     logRemotely("Unknown config key " + String(k) + " with value " + String(v));
@@ -476,8 +485,8 @@ void printConfig() {
 
   }
 
-  Serial.printf("Config: sleepInterval=%d, hibernationTime=%d, alarmKeepAwakeTime=%d, alarmHibernationInhibitTime=%d, alarmLightsOnTime=%d, alarmBlinkingTime=%d, blinkingIntervalMs=%d, alarmCamerasOnTime=%d, lightsMode=%s(%d), camerasMode=%s(%d), activeSensors=" PRINTF_BINARY_PATTERN_INT8 "\n",
-                config.sleepInterval, config.hibernationTime, config.alarmKeepAwakeTime, config.alarmHibernationInhibitTime, config.alarmLightsOnTime, config.alarmBlinkingTime, config.blinkingIntervalMs, config.alarmCamerasOnTime, lightsMode, config.lightsMode, camerasMode, config.camerasMode, PRINTF_BYTE_TO_BINARY_INT8(config.activeSensors));
+  Serial.printf("Config: sleepInterval=%d, hibernationTime=%d, alarmKeepAwakeTime=%d, alarmHibernationInhibitTime=%d, alarmLightsOnTime=%d, alarmBlinkingTime=%d, blinkingIntervalMs=%d, alarmCamerasOnTime=%d, lightsMode=%s(%d), camerasMode=%s(%d), activeSensors=" PRINTF_BINARY_PATTERN_INT8 ", networkWatchdogTimeout=%d, restartInterval=%d\n",
+                config.sleepInterval, config.hibernationTime, config.alarmKeepAwakeTime, config.alarmHibernationInhibitTime, config.alarmLightsOnTime, config.alarmBlinkingTime, config.blinkingIntervalMs, config.alarmCamerasOnTime, lightsMode, config.lightsMode, camerasMode, config.camerasMode, PRINTF_BYTE_TO_BINARY_INT8(config.activeSensors), config.networkWatchdogTimeout, config.restartInterval);
 }
 
 void setupGpio() {
@@ -555,12 +564,27 @@ void readInputs() {
   }
 }
 
-void gpioTask(void * p) {
+void restart(char * logMsg) {
+  Serial.println(logMsg);
+  Serial.flush();
+  ESP.restart();
+}
 
+void checkForReboot() {
+  unsigned long now = millis()/1000;
+  if (now > lastNetworkRead + config.networkWatchdogTimeout) {
+    restart("NETWORK WATCHDOG TIMEOUT!!!");
+  } else if (now > config.restartInterval) {
+    restart("Periodic restart");
+  }
+}
+
+void gpioTask(void * p) {
   while (true) {
     handleAlarmTimeTick();
     driveOutputs();
     readInputs();
+    checkForReboot();
     delay(20);
   }
 }
@@ -643,6 +667,10 @@ void loop() {
 
   notifyIfAlarmTriggered();
   configUpdated = updateConfig();
+
+  if (configUpdated) {
+    lastNetworkRead = millis() / 1000;
+  }
 
   uint32_t tempMv = 0, battMv = 0;
   for (int i=0; i<ADC_SAMPLES; i++) {
