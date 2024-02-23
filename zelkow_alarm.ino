@@ -27,6 +27,15 @@ SET_LOOP_TASK_STACK_SIZE(48 * 1024);
 gpio_num_t sensorPins[] = {GPIO_NUM_16, GPIO_NUM_17, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_22, GPIO_NUM_23 };
 #define SENSORS_NUMBER (sizeof(sensorPins)/sizeof(gpio_num_t))
 
+char* sensorNames[] = {
+  "Ogrod%20tyl",
+  "Wejscie",
+  "Brama",
+  "Z%20tylu",
+  "Taras",
+  "Ogrod%20przod"
+};
+
 #define ADC_SAMPLES 10
 
 #define NTP_RESYNC_INTERVAL 1800
@@ -725,19 +734,22 @@ void notifyIfAlarmTriggered() {
     client.setInsecure();
     HttpClient http(client, triggerHost, 443);
 
+    char path[128];
+    sprintf(path, alarmPath, sensorNames[sensor-1]);
+    
     for (; i < MAX_GET_ATTEMPTS; i++) {
-      int r = http.get(alarmPath);
+      int r = http.get(path);
       if (r != 0) {
-        Serial.println("ALARM TRIGGERED - ERROR on GET from " + String(alarmPath) + " : " + String(r));
-        logRemotely("ALARM TRIGGERED - ERROR on GET from " + String(alarmPath) + " : " + String(r));
+        Serial.println("ALARM TRIGGERED - ERROR on GET from " + String(path) + " : " + String(r));
+        logRemotely("ALARM TRIGGERED - ERROR on GET from " + String(path) + " : " + String(r));
         delay(100);
         continue;
       }
  
       int httpCode = http.responseStatusCode();
       if (httpCode != 200) {
-        Serial.println("ALARM TRIGGERED - Non 200 on GET from " + String(alarmPath) + " : " + String(httpCode));
-        logRemotely("ALARM TRIGGERED - Non 200 on GET from " + String(alarmPath) + " : " + String(httpCode));
+        Serial.println("ALARM TRIGGERED - Non 200 on GET from " + String(path) + " : " + String(httpCode));
+        logRemotely("ALARM TRIGGERED - Non 200 on GET from " + String(path) + " : " + String(httpCode));
         delay(100);
         continue;
       }
