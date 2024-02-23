@@ -14,6 +14,13 @@ SET_LOOP_TASK_STACK_SIZE(48 * 1024);
 #include "esp_random.h"
 #include "mbedtls/pem.h"
 #include "esp_sntp.h"
+#include "soc/rtc_wdt.h"
+#include "esp_int_wdt.h"
+#include "esp_task_wdt.h"
+
+#define WDT_TIMEOUT_MARGIN 600
+
+#define WATCHDOG_TIMEOUT() ((config.sleepInterval > config.hibernationTime ? config.sleepInterval : config.hibernationTime)+WDT_TIMEOUT_MARGIN)*1000
 
 #define MODEM_GPIO_PIN 27
 #define CAMERAS_GPIO_PIN 12
@@ -513,12 +520,31 @@ void ntpCallback(struct timeval *tv) {
   Serial.println("NTP SYNC");
 }
 
+void setWatchdog() {
+  rtc_wdt_protect_off();
+  rtc_wdt_set_stage(RTC_WDT_STAGE0, RTC_WDT_STAGE_ACTION_RESET_RTC);
+  rtc_wdt_set_time(RTC_WDT_STAGE0, WATCHDOG_TIMEOUT());
+  rtc_wdt_enable();
+  CLEAR_PERI_REG_MASK(RTC_CNTL_WDTCONFIG0_REG, RTC_CNTL_WDT_PAUSE_IN_SLP);
+  rtc_wdt_protect_on();
+  Serial.printf("Watchdog set to %d ms\n", WATCHDOG_TIMEOUT());
+}
+
+void resetWatchdog() {
+  rtc_wdt_protect_off();
+  rtc_wdt_feed();
+  rtc_wdt_protect_on();
+  Serial.println("Watchdog reset");
+}
+
 void setup() {
   setCpuFrequencyMhz(80);
   setupSerial();
   setupGpio();
   configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", ntpServer);
   sntp_set_time_sync_notification_cb(ntpCallback);
+
+  setWatchdog();
 
   TaskHandle_t task;
   xTaskCreatePinnedToCore(gpioTask, /* Function to implement the task */
@@ -677,6 +703,8 @@ void loop() {
   notifyIfAlarmTriggered();
   configUpdated = updateConfig();
 
+  setWatchdog();
+
   if (configUpdated) {
     lastNetworkRead = millis() / 1000;
   }
@@ -698,6 +726,8 @@ void loop() {
 
   if (canSleep()) sleep();
   else delay (100);
+
+  resetWatchdog();
 }
 
 volatile void alarmTriggered(int sensor) {
