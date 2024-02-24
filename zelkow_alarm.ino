@@ -17,6 +17,7 @@ SET_LOOP_TASK_STACK_SIZE(48 * 1024);
 #include "soc/rtc_wdt.h"
 #include "esp_int_wdt.h"
 #include "esp_task_wdt.h"
+#include <Wire.h>
 
 #define WDT_TIMEOUT_MARGIN 600
 
@@ -30,6 +31,14 @@ SET_LOOP_TASK_STACK_SIZE(48 * 1024);
 #define TEMPERATURE_ADC_GPIO_PIN 36
 #define BATT_VOLTAGE_ADC_GPIO_PIN 39
 
+#define SDA_PIN GPIO_NUM_32
+#define SCL_PIN GPIO_NUM_33
+
+#define I2C_FREQ_HZ 9600
+#define SHTC3_ADDR 0x70
+#define SHTC3_MEASURE_CMD 0x7866 // normal mode, no stretching
+
+#define MEASURMENT_SLEEP_TIME_MSEC 11
 
 gpio_num_t sensorPins[] = {GPIO_NUM_16, GPIO_NUM_17, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_22, GPIO_NUM_23 };
 #define SENSORS_NUMBER (sizeof(sensorPins)/sizeof(gpio_num_t))
@@ -514,6 +523,9 @@ void setupGpio() {
   for (int i=0; i<SENSORS_NUMBER; i++) {
     pinMode(sensorPins[i], INPUT_PULLDOWN);
   }
+
+  pinMode(SDA_PIN, INPUT_PULLUP);
+  pinMode(SCL_PIN, INPUT_PULLUP);
 }
 
 void ntpCallback(struct timeval *tv) {
@@ -534,7 +546,7 @@ void resetWatchdog() {
   rtc_wdt_protect_off();
   rtc_wdt_feed();
   rtc_wdt_protect_on();
-  Serial.println("Watchdog reset");
+  Serial.println("Watchdog timer restarted");
 }
 
 void setup() {
@@ -558,6 +570,9 @@ void setup() {
   connectToWifi();
   struct tm timeinfo;
   getLocalTime(&timeinfo);
+
+  Wire.begin(SDA_PIN, SCL_PIN, I2C_FREQ_HZ);
+
   Serial.println("Startup");
   logRemotely("Startup");
 }
@@ -696,6 +711,42 @@ void resyncNtp() {
   }
 }
 
+int16_t getTemperature(uint16_t raw) {
+  return -4500+17500*raw/65536;
+}
+uint16_t getHumidity(uint16_t raw) {
+  return raw*10000/65536;
+}
+
+void readI2CSensor(int16_t * temp, uint16_t * rh) {
+  Wire.beginTransmission(SHTC3_ADDR); // transmit to device #4
+  Wire.write((SHTC3_MEASURE_CMD >> 8) & 0xFF);
+  Wire.write(SHTC3_MEASURE_CMD & 0xFF);
+  Wire.endTransmission();
+
+  delay(MEASURMENT_SLEEP_TIME_MSEC);
+
+  uint8_t bytesReceived = Wire.requestFrom(SHTC3_ADDR, 5);
+  Serial.printf("Read %d bytes from I2C\n", bytesReceived);
+  if(bytesReceived) { //If received more than zero bytes
+    uint8_t buff[5];
+    Wire.readBytes(buff, 5);
+    *temp = getTemperature((buff[0] << 8) | buff[1]);
+    *rh = getHumidity((buff[3] << 8) | buff[4]);
+  }
+}
+
+void readAdcSensors(uint32_t *tempMv, uint32_t *battMv) {
+  for (int i=0; i<ADC_SAMPLES; i++) {
+    adc.attach(TEMPERATURE_ADC_GPIO_PIN);
+    *tempMv += adc.readMiliVolts();
+    adc.attach(BATT_VOLTAGE_ADC_GPIO_PIN);
+    *battMv += adc.readMiliVolts();
+  }
+  *tempMv = *tempMv / ADC_SAMPLES;
+  *battMv = *battMv / ADC_SAMPLES;
+}
+
 void loop() {
   connectToWifi();
   resyncNtp();
@@ -710,17 +761,13 @@ void loop() {
   }
 
   uint32_t tempMv = 0, battMv = 0;
-  for (int i=0; i<ADC_SAMPLES; i++) {
-    adc.attach(TEMPERATURE_ADC_GPIO_PIN);
-    tempMv += adc.readMiliVolts();
-    adc.attach(BATT_VOLTAGE_ADC_GPIO_PIN);
-    battMv += adc.readMiliVolts();
-  }
-  tempMv = tempMv / ADC_SAMPLES;
-  battMv = battMv / ADC_SAMPLES;
+  int16_t temp = 0;
+  uint16_t rh = 0;
+  readAdcSensors(&tempMv, &battMv);
+  readI2CSensor(&temp, &rh);
 
-  char buff[64];
-  snprintf(buff, 63, "Alive... Batt ADC=%dmV, Temp ADC=%dmV, uptime=%ds", battMv, tempMv, millis() / 1000);
+  char buff[96];
+  snprintf(buff, 95, "Alive... Batt ADC=%dmV, Temp ADC=%dmV, Temp=%d, RH=%d, uptime=%ds", battMv, tempMv, temp, rh, millis() / 1000);
   Serial.println(buff);
   logRemotely(buff);
 
