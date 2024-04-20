@@ -65,6 +65,11 @@ const char* ntpServer = "pool.ntp.org";
 
 char googleApiToken[1025];
 
+#define NOTIFICATIONS_BUFFER_SIZE 20
+#define NOTIFICATION_LENGTH 30
+char notificationsBuffer[NOTIFICATIONS_BUFFER_SIZE][NOTIFICATION_LENGTH];
+uint8_t stashedNotifications = 0;
+
 ESP32AnalogRead adc;
 
 struct configData {
@@ -79,6 +84,7 @@ struct configData {
   uint lightsMode;
   uint camerasMode;
   uint activeSensors;
+  uint notificationsInterval;
   uint networkWatchdogTimeout;
   uint restartInterval;
 };
@@ -113,12 +119,14 @@ volatile configData config = {
   .lightsMode = LIGHTS_MODE_AUTO,
   .camerasMode = CAMERAS_MODE_AUTO,
   .activeSensors = 0b111111,
+  .notificationsInterval = 300,
   .networkWatchdogTimeout = 3600,
   .restartInterval = 24*3600
 };
 
 volatile unsigned long alarmTriggeredTime = 0;
 volatile unsigned long lastNetworkRead = 0;
+volatile unsigned long lastNotificationSendTime = 0;
 
 volatile uint alarmLightsState = LIGHTS_MODE_OFF;
 volatile uint alarmCamerasState = CAMERAS_MODE_OFF;
@@ -155,6 +163,17 @@ void connectToWifi() {
   }
 }
 
+time_t getLocalTime() {
+  time_t now;
+  time(&now);
+  tm t = * localtime(&now);
+  uint8_t localHour = t.tm_hour;
+  t =  * gmtime(&now);
+  uint8_t utcHour = t.tm_hour;
+  uint8_t diff = (localHour-utcHour+24)%24;
+  return now+3600*diff;
+}
+
 void logRemotely(String l) {
   int r = refreshToken();
   if (r != 0) {
@@ -165,15 +184,9 @@ void logRemotely(String l) {
   client.setInsecure();
   HttpClient http(client, sheetsHost, 443);
 
-  time_t now;
-  time(&now);
-  tm t = * localtime(&now);
-  uint8_t localHour = t.tm_hour;
-  t =  * gmtime(&now);
-  uint8_t utcHour = t.tm_hour;
-  uint8_t diff = (localHour-utcHour+24)%24;
+  time_t localTime = getLocalTime();
   
-  String body = "{\"range\": \"Log\",\"majorDimension\": \"ROWS\",\"values\": [[\"=ROW()\",\"=EPOCHTODATE(" + String(now+3600*diff) + ")\",\"" + l + "\"]]}";
+  String body = "{\"range\": \"Log\",\"majorDimension\": \"ROWS\",\"values\": [[\"=ROW()\",\"=EPOCHTODATE(" + String(localTime) + ")\",\"" + l + "\"]]}";
   String path = String(appendLogPath) + "&access_token=" + googleApiToken;
   r = http.post(path, "application/json", body);
 
@@ -479,6 +492,9 @@ void updateConfigAttribute(const char* k, const char* v) {
   else if (!strcmp(k, "activeSensors")) {
     config.activeSensors = std::stoi(v, nullptr,2);
   }
+  else if (!strcmp(k, "notificationsInterval")) {
+    config.notificationsInterval = atoi(v);
+  }
   else if (!strcmp(k, "networkWatchdogTimeout")) {
     config.networkWatchdogTimeout = atoi(v);
   }
@@ -510,8 +526,8 @@ void printConfig() {
 
   }
 
-  Serial.printf("Config: sleepInterval=%d, hibernationTime=%d, alarmKeepAwakeTime=%d, alarmHibernationInhibitTime=%d, alarmLightsOnTime=%d, alarmBlinkingTime=%d, blinkingIntervalMs=%d, alarmCamerasOnTime=%d, lightsMode=%s(%d), camerasMode=%s(%d), activeSensors=" PRINTF_BINARY_PATTERN_INT8 ", networkWatchdogTimeout=%d, restartInterval=%d\n",
-                config.sleepInterval, config.hibernationTime, config.alarmKeepAwakeTime, config.alarmHibernationInhibitTime, config.alarmLightsOnTime, config.alarmBlinkingTime, config.blinkingIntervalMs, config.alarmCamerasOnTime, lightsMode, config.lightsMode, camerasMode, config.camerasMode, PRINTF_BYTE_TO_BINARY_INT8(config.activeSensors), config.networkWatchdogTimeout, config.restartInterval);
+  Serial.printf("Config: sleepInterval=%d, hibernationTime=%d, alarmKeepAwakeTime=%d, alarmHibernationInhibitTime=%d, alarmLightsOnTime=%d, alarmBlinkingTime=%d, blinkingIntervalMs=%d, alarmCamerasOnTime=%d, lightsMode=%s(%d), camerasMode=%s(%d), activeSensors=" PRINTF_BINARY_PATTERN_INT8 ", notificationsInterval=%d, networkWatchdogTimeout=%d, restartInterval=%d\n",
+                config.sleepInterval, config.hibernationTime, config.alarmKeepAwakeTime, config.alarmHibernationInhibitTime, config.alarmLightsOnTime, config.alarmBlinkingTime, config.blinkingIntervalMs, config.alarmCamerasOnTime, lightsMode, config.lightsMode, camerasMode, config.camerasMode, PRINTF_BYTE_TO_BINARY_INT8(config.activeSensors), config.notificationsInterval, config.networkWatchdogTimeout, config.restartInterval);
 }
 
 void setupGpio() {
@@ -653,6 +669,9 @@ void sleep() {
   uint32_t sleepTime;
   
   if (canHibernate()) {
+    sendStashedNotifications();
+    lastNotificationSendTime = 0;
+
     sleepTime = config.hibernationTime;
     char buff[32];
     snprintf(buff, 31, "Hibernating for %d sec", sleepTime);
@@ -751,7 +770,7 @@ void loop() {
   connectToWifi();
   resyncNtp();
 
-  notifyIfAlarmTriggered();
+  handleAlarmTriggerAndNotifications();
   configUpdated = updateConfig();
 
   setWatchdog();
@@ -798,39 +817,18 @@ void handleAlarmTimeTick() {
   }
 }
 
-void notifyIfAlarmTriggered() {
+void handleAlarmTriggerAndNotifications() {
   int sensor = 0;
   if (newAlarmTriggered) {
     sensor = newAlarmTriggered;
     newAlarmTriggered = 0;
   }
 
-  int i = 0;
   if (sensor) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    HttpClient http(client, triggerHost, 443);
+    bool success = notifyAlarmTriggered(sensor);
 
-    char path[128];
-    sprintf(path, alarmPath, sensorNames[sensor-1]);
-    
-    for (; i < MAX_GET_ATTEMPTS; i++) {
-      int r = http.get(path);
-      if (r != 0) {
-        Serial.println("ALARM TRIGGERED - ERROR on GET from " + String(path) + " : " + String(r));
-        logRemotely("ALARM TRIGGERED - ERROR on GET from " + String(path) + " : " + String(r));
-        delay(100);
-        continue;
-      }
- 
-      int httpCode = http.responseStatusCode();
-      if (httpCode != 200) {
-        Serial.println("ALARM TRIGGERED - Non 200 on GET from " + String(path) + " : " + String(httpCode));
-        logRemotely("ALARM TRIGGERED - Non 200 on GET from " + String(path) + " : " + String(httpCode));
-        delay(100);
-        continue;
-      }
-      break;
+    if (!success && newAlarmTriggered == 0) {
+      newAlarmTriggered = sensor;
     }
 
     char buff[32];
@@ -839,10 +837,87 @@ void notifyIfAlarmTriggered() {
     logRemotely(buff);
   }
 
-  if (i == MAX_GET_ATTEMPTS && newAlarmTriggered == 0) {
-    newAlarmTriggered = sensor;
+  unsigned long now = millis() / 1000;
+  if (now > lastNotificationSendTime + config.notificationsInterval) {
+    sendStashedNotifications();
   }
 }
 
+bool notifyAlarmTriggered(int sensor) {
+  char notification[NOTIFICATION_LENGTH];
+  writeNotification(notification, sensor);
 
-// TODO: 2nd cam, ota
+  if (config.notificationsInterval > 0 && lastNotificationSendTime > 0) {
+    Serial.printf("Stashing notification: %s\n", notification);
+    stashNotification(notification);
+    return true;
+  } else {
+    Serial.printf("Sending notification: %s\n", notification);
+    return sendNotification(notification, NOTIFICATION_LENGTH);
+  }
+}
+
+bool sendNotification(char* message, uint len) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HttpClient http(client, triggerHost, 443);
+
+    char path[128+len];
+    sprintf(path, alarmPath, message);
+
+    int i = 0;
+    for (; i < MAX_GET_ATTEMPTS; i++) {
+      int r = http.get(path);
+      if (r != 0) {
+        Serial.println("SEND NOTIFICATION - ERROR on GET from " + String(path) + " : " + String(r));
+        logRemotely("SEND NOTIFICATION - ERROR on GET from " + String(path) + " : " + String(r));
+        delay(100);
+        continue;
+      }
+ 
+      int httpCode = http.responseStatusCode();
+      if (httpCode != 200) {
+        Serial.println("SEND NOTIFICATION - Non 200 on GET from " + String(path) + " : " + String(httpCode));
+        logRemotely("SEND NOTIFICATION - Non 200 on GET from " + String(path) + " : " + String(httpCode));
+        delay(100);
+        continue;
+      }
+      lastNotificationSendTime = millis() / 1000;
+      return true;
+    }
+    return false;
+}
+
+void writeNotification(char *notification, int sensor) {
+  time_t now;
+  time(&now);
+  tm t = * localtime(&now);
+  uint8_t h = t.tm_hour;
+  uint8_t m = t.tm_min;
+  uint8_t s = t.tm_sec;
+
+  sprintf(notification, "%02d:%02d:%02d:%%20%s", h,m,s, sensorNames[sensor-1]);
+}
+
+void stashNotification(char * notification) {
+  strncpy(notificationsBuffer[stashedNotifications % NOTIFICATIONS_BUFFER_SIZE], notification, NOTIFICATION_LENGTH);
+  stashedNotifications++;
+}
+
+void sendStashedNotifications() {
+  if (stashedNotifications > 0) {
+    Serial.printf("Sending %d stahsed notifications\n", stashedNotifications);
+    char msg[NOTIFICATIONS_BUFFER_SIZE * NOTIFICATION_LENGTH + 30];
+    uint offset = sprintf(msg, "%d%%20stashed%%20notifications:", stashedNotifications);
+    uint8_t startIndex = stashedNotifications > NOTIFICATIONS_BUFFER_SIZE ? stashedNotifications % NOTIFICATIONS_BUFFER_SIZE : 0;
+    uint8_t n = stashedNotifications < NOTIFICATIONS_BUFFER_SIZE ? stashedNotifications : NOTIFICATIONS_BUFFER_SIZE;
+
+    for(uint8_t i = 0; i<n;i++) {
+      offset += sprintf(msg+offset, "%%0A%s",notificationsBuffer[(i+startIndex) % NOTIFICATIONS_BUFFER_SIZE]);
+    }
+    sendNotification(msg, offset);
+    stashedNotifications = 0;
+  }
+}
+
+// TODO: ota
